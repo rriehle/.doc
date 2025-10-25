@@ -1,0 +1,316 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-search
+  "Search documentation by keywords, content, or cross-references.
+   Supports searching across multiple projects."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def find-doc-files (:find-doc-files doc-core/exports))
+(def extract-keywords-from-file (:extract-keywords-from-file doc-core/exports))
+(def extract-cross-refs-from-file (:extract-cross-refs-from-file doc-core/exports))
+
+;; ============================================================================
+;; Search Functions
+;; ============================================================================
+
+(defn search-by-keyword
+  "Search for files containing a specific keyword.
+
+   Args:
+     files: Sequence of file paths
+     keyword: Keyword to search for (as Clojure keyword)
+     doc-dir: Documentation directory (for relative paths)
+
+   Returns:
+     Sequence of {:file \"...\" :keywords #{...}} maps"
+  [files keyword doc-dir]
+  (->> files
+       (map (fn [file]
+              (let [keywords (extract-keywords-from-file file)]
+                {:file (str/replace file (str doc-dir "/") "")
+                 :keywords keywords})))
+       (filter #(contains? (:keywords %) keyword))))
+
+(defn search-by-content
+  "Search for files containing specific text in content.
+
+   Args:
+     files: Sequence of file paths
+     query: Text to search for (case-insensitive)
+     doc-dir: Documentation directory (for relative paths)
+
+   Returns:
+     Sequence of {:file \"...\" :matches [...]} maps"
+  [files query doc-dir]
+  (let [pattern (re-pattern (str "(?i)" (java.util.regex.Pattern/quote query)))]
+    (->> files
+         (keep (fn [file]
+                 (try
+                   (let [content (slurp file)
+                         lines (str/split-lines content)
+                         matches (keep-indexed
+                                  (fn [idx line]
+                                    (when (re-find pattern line)
+                                      {:line-num (inc idx)
+                                       :line (str/trim line)}))
+                                  lines)]
+                     (when (seq matches)
+                       {:file (str/replace file (str doc-dir "/") "")
+                        :matches matches}))
+                   (catch Exception e
+                     (println "Warning: Error searching" file ":" (.getMessage e))
+                     nil)))))))
+
+(defn search-by-cross-ref
+  "Search for files containing specific cross-references.
+
+   Args:
+     files: Sequence of file paths
+     ref-type: :adr, :req, or :runnote
+     ref-id: Reference ID to search for
+     doc-dir: Documentation directory (for relative paths)
+
+   Returns:
+     Sequence of {:file \"...\" :refs #{...}} maps"
+  [files ref-type ref-id doc-dir]
+  (let [ref-key (keyword (str (name ref-type) "-refs"))]
+    (->> files
+         (keep (fn [file]
+                 (let [refs (extract-cross-refs-from-file file)
+                       ref-set (get refs ref-key)]
+                   (when (contains? ref-set ref-id)
+                     {:file (str/replace file (str doc-dir "/") "")
+                      :refs ref-set})))))))
+
+(defn search-project
+  "Search a single project.
+
+   Args:
+     project-root: Project root path (nil for auto-discovery)
+     search-mode: :keyword, :content, or :cross-ref
+     query: Search query (keyword, text, or ref-id)
+     options: Optional {:ref-type :adr|:req|:runnote}
+
+   Returns:
+     {:project-name \"...\"
+      :results [...]
+      :total-results integer}"
+  [project-root search-mode query options]
+  (let [ctx (load-project-context project-root)
+        config-result (:config-result ctx)
+        doc-dir (:doc-dir ctx)
+        files (find-doc-files config-result)
+        project-name (fs/file-name (:project-root config-result))
+        results (case search-mode
+                  :keyword (search-by-keyword files query doc-dir)
+                  :content (search-by-content files query doc-dir)
+                  :cross-ref (search-by-cross-ref files (:ref-type options) query doc-dir)
+                  [])]
+    {:project-name project-name
+     :results results
+     :total-results (count results)}))
+
+;; ============================================================================
+;; Display Functions
+;; ============================================================================
+
+(defn print-keyword-results
+  "Print results from keyword search."
+  [project-name results show-header?]
+  (when show-header?
+    (println)
+    (println "======================")
+    (println "Project:" project-name)
+    (println "======================"))
+
+  (if (empty? results)
+    (println "No files found")
+    (do
+      (println "Found" (count results) "file(s):")
+      (doseq [{:keys [file keywords]} results]
+        (println (str "  " file))
+        (println (str "    Keywords: " (str/join " " (map #(str ":" (name %)) (sort keywords)))))))))
+
+(defn print-content-results
+  "Print results from content search."
+  [project-name results show-header?]
+  (when show-header?
+    (println)
+    (println "======================")
+    (println "Project:" project-name)
+    (println "======================"))
+
+  (if (empty? results)
+    (println "No matches found")
+    (do
+      (println "Found" (count results) "file(s) with matches:")
+      (doseq [{:keys [file matches]} results]
+        (println (str "\n" file ":"))
+        (doseq [{:keys [line-num line]} matches]
+          (println (format "  %4d: %s" line-num line)))))))
+
+(defn print-cross-ref-results
+  "Print results from cross-reference search."
+  [project-name results show-header?]
+  (when show-header?
+    (println)
+    (println "======================")
+    (println "Project:" project-name)
+    (println "======================"))
+
+  (if (empty? results)
+    (println "No references found")
+    (do
+      (println "Found" (count results) "file(s) with references:")
+      (doseq [{:keys [file refs]} results]
+        (println (str "  " file))
+        (println (str "    References: " (str/join " " (sort refs))))))))
+
+(defn print-results
+  "Print search results based on search mode."
+  [search-mode project-result show-header?]
+  (let [{:keys [project-name results]} project-result]
+    (case search-mode
+      :keyword (print-keyword-results project-name results show-header?)
+      :content (print-content-results project-name results show-header?)
+      :cross-ref (print-cross-ref-results project-name results show-header?))))
+
+;; ============================================================================
+;; Multi-Project Support
+;; ============================================================================
+
+(defn resolve-projects
+  "Resolve list of project roots from args."
+  [args]
+  (if (empty? args)
+    [nil]
+    (map #(str (fs/absolutize %)) args)))
+
+(defn search-projects
+  "Search across multiple projects."
+  [projects search-mode query options]
+  (map #(search-project % search-mode query options) projects))
+
+;; ============================================================================
+;; Command-Line Parsing
+;; ============================================================================
+
+(defn parse-args
+  "Parse command-line arguments.
+
+   Returns:
+     {:search-mode :keyword|:content|:cross-ref
+      :query \"...\"
+      :options {...}
+      :projects [...]
+      :error nil|\"error message\"}"
+  [args]
+  (cond
+    ;; Keyword search: doc-search keyword :architecture [projects...]
+    (and (>= (count args) 2)
+         (= "keyword" (first args)))
+    (let [kw (keyword (str/replace (second args) ":" ""))
+          projects (drop 2 args)]
+      {:search-mode :keyword
+       :query kw
+       :options {}
+       :projects (resolve-projects projects)
+       :error nil})
+
+    ;; Content search: doc-search content "search term" [projects...]
+    (and (>= (count args) 2)
+         (= "content" (first args)))
+    {:search-mode :content
+     :query (second args)
+     :options {}
+     :projects (resolve-projects (drop 2 args))
+     :error nil}
+
+    ;; Cross-ref search: doc-search adr 00042 [projects...]
+    (and (>= (count args) 2)
+         (contains? #{"adr" "req" "runnote"} (first args)))
+    {:search-mode :cross-ref
+     :query (second args)
+     :options {:ref-type (keyword (first args))}
+     :projects (resolve-projects (drop 2 args))
+     :error nil}
+
+    :else
+    {:error "Invalid arguments"}))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-search - Search documentation by keywords, content, or cross-references")
+  (println)
+  (println "Usage:")
+  (println "  doc-search keyword <keyword> [project ...]      # Search by keyword")
+  (println "  doc-search content <text> [project ...]         # Search by content")
+  (println "  doc-search adr <id> [project ...]               # Search for ADR references")
+  (println "  doc-search req <id> [project ...]               # Search for requirement references")
+  (println "  doc-search runnote <id> [project ...]           # Search for RunNotes references")
+  (println)
+  (println "Arguments:")
+  (println "  <keyword>  - Keyword to search for (e.g., :architecture or architecture)")
+  (println "  <text>     - Text to search for in file content")
+  (println "  <id>       - Reference ID (e.g., 00042 for ADR, REQ-AUTH-001 for req)")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println)
+  (println "Examples:")
+  (println "  doc-search keyword :architecture                 # Find docs with :architecture keyword")
+  (println "  doc-search content \"database migration\"          # Find docs mentioning migration")
+  (println "  doc-search adr 00042                             # Find docs referencing ADR-00042")
+  (println "  doc-search req REQ-AUTH-001                      # Find docs referencing requirement")
+  (println "  doc-search keyword :security ~/p1 ~/p2           # Search multiple projects"))
+
+(defn -main
+  "Main entry point for doc-search command."
+  [& args]
+  (cond
+    (or (empty? args) (some #{"--help" "-h" "help"} args))
+    (print-usage)
+
+    :else
+    (let [parsed (parse-args args)]
+      (if (:error parsed)
+        (do
+          (println "Error:" (:error parsed))
+          (println)
+          (print-usage)
+          (System/exit 1))
+
+        (let [{:keys [search-mode query options projects]} parsed
+              results (search-projects projects search-mode query options)
+              show-headers? (> (count projects) 1)]
+
+          ;; Print results for each project
+          (doseq [result results]
+            (print-results search-mode result show-headers?)))))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:search-by-keyword search-by-keyword
+   :search-by-content search-by-content
+   :search-by-cross-ref search-by-cross-ref
+   :search-project search-project
+   :parse-args parse-args})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

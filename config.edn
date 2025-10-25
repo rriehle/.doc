@@ -1,0 +1,12 @@
+{:doc
+ {:path "doc"
+  :taxonomy "doc-tools/keyword-taxonomy.md"
+  :template-dir "~/.doc/template"
+  :excluded-patterns #{"README.md" "CHANGELOG.md" "LICENSE.md"}
+  :metadata-mode :hybrid
+  :metadata-schema :standard
+  :validation {:strict false
+               :require-taxonomy false}
+  :cross-refs {:enable-adr true
+               :enable-req true
+               :enable-runnote true}}}

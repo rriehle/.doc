@@ -1,0 +1,186 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-index
+  "Build keyword index mapping keywords to files.
+   Outputs JSON format suitable for search tools and integrations."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]
+            [cheshire.core :as json]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def find-doc-files (:find-doc-files doc-core/exports))
+(def extract-keywords-from-file (:extract-keywords-from-file doc-core/exports))
+
+;; ============================================================================
+;; Index Building
+;; ============================================================================
+
+(defn build-file-index
+  "Build index for a single file.
+
+   Args:
+     file-path: Path to markdown file
+     doc-dir: Documentation directory (for relative paths)
+     project-name: Project name (for multi-project indexing)
+     multi-project?: Whether this is a multi-project index
+
+   Returns:
+     Map of keyword -> file reference"
+  [file-path doc-dir project-name multi-project?]
+  (let [keywords (extract-keywords-from-file file-path)
+        rel-path (str/replace file-path (str doc-dir "/") "")
+        file-ref (if multi-project?
+                   (str project-name "/" rel-path)
+                   rel-path)]
+    (into {} (map (fn [kw] [kw #{file-ref}]) keywords))))
+
+(defn merge-indices
+  "Merge multiple keyword indices.
+
+   Args:
+     indices: Sequence of index maps
+
+   Returns:
+     Merged index with sets of file references"
+  [indices]
+  (apply merge-with
+         (fn [s1 s2]
+           (if (set? s1)
+             (into s1 s2)
+             #{s1 s2}))
+         indices))
+
+(defn build-project-index
+  "Build keyword index for a single project.
+
+   Args:
+     project-root: Project root path (nil for auto-discovery)
+     multi-project?: Whether this is part of multi-project indexing
+
+   Returns:
+     {:project-name \"...\"
+      :index {keyword -> #{file...}}
+      :total-files integer
+      :total-keywords integer}"
+  [project-root multi-project?]
+  (let [ctx (load-project-context project-root)
+        config-result (:config-result ctx)
+        doc-dir (:doc-dir ctx)
+        files (find-doc-files config-result)
+        project-name (fs/file-name (:project-root config-result))
+        indices (map #(build-file-index % doc-dir project-name multi-project?) files)
+        merged-index (merge-indices indices)]
+    {:project-name project-name
+     :index merged-index
+     :total-files (count files)
+     :total-keywords (count merged-index)}))
+
+(defn build-multi-project-index
+  "Build combined index across multiple projects.
+
+   Args:
+     projects: Sequence of project root paths
+
+   Returns:
+     Combined index map"
+  [projects]
+  (let [multi-project? (> (count projects) 1)
+        project-indices (map #(build-project-index % multi-project?) projects)
+        indices (map :index project-indices)
+        combined (merge-indices indices)]
+    combined))
+
+;; ============================================================================
+;; Output Formatting
+;; ============================================================================
+
+(defn format-index-for-json
+  "Format index for JSON output.
+   Converts keywords to strings and sets to sorted vectors.
+
+   Args:
+     index: Index map with keyword keys and set values
+
+   Returns:
+     Map with string keys and vector values"
+  [index]
+  (into {}
+        (map (fn [[kw files]]
+               [(name kw) (vec (sort files))])
+             index)))
+
+;; ============================================================================
+;; Multi-Project Support
+;; ============================================================================
+
+(defn resolve-projects
+  "Resolve list of project roots from args."
+  [args]
+  (if (empty? args)
+    [nil]
+    (map #(str (fs/absolutize %)) args)))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-index - Build keyword index for documentation")
+  (println)
+  (println "Usage: doc-index [project ...]")
+  (println)
+  (println "Arguments:")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println "               Multiple projects can be specified for cross-project indexing")
+  (println)
+  (println "Output:")
+  (println "  JSON object mapping keywords to file paths")
+  (println)
+  (println "Examples:")
+  (println "  doc-index                        # Index current project")
+  (println "  doc-index ~/proj1                # Index specific project")
+  (println "  doc-index ~/p1 ~/p2 ~/p3        # Build cross-project index")
+  (println "  doc-index > keywords.json        # Save index to file")
+  (println)
+  (println "JSON Format:")
+  (println "  {")
+  (println "    \"architecture\": [\"guide/architecture.md\", \"adr/ADR-001.md\"],")
+  (println "    \"security\": [\"security/overview.md\"]")
+  (println "  }"))
+
+(defn -main
+  "Main entry point for doc-index command."
+  [& args]
+  (cond
+    (some #{"--help" "-h" "help"} args)
+    (print-usage)
+
+    :else
+    (let [projects (resolve-projects args)
+          index (build-multi-project-index projects)
+          formatted (format-index-for-json index)]
+      (println (json/generate-string formatted {:pretty true})))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:build-file-index build-file-index
+   :build-project-index build-project-index
+   :build-multi-project-index build-multi-project-index
+   :merge-indices merge-indices
+   :format-index-for-json format-index-for-json})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

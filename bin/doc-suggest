@@ -1,0 +1,244 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-suggest
+  "Suggest keywords for a file based on content analysis.
+   Uses pattern matching and taxonomy alignment."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def load-taxonomy (:load-taxonomy doc-core/exports))
+
+;; ============================================================================
+;; Suggestion Patterns
+;; ============================================================================
+
+(def suggestion-patterns
+  "Patterns for suggesting keywords based on content.
+   Each pattern maps to a keyword and has a regex and confidence score."
+  [{:keyword :architecture
+    :pattern #"(?i)architecture|design pattern|modularity|layering|abstraction"
+    :confidence 0.85}
+
+   {:keyword :security
+    :pattern #"(?i)security|threat|vulnerability|attack|exploit|encryption|authentication"
+    :confidence 0.90}
+
+   {:keyword :authentication
+    :pattern #"(?i)authentication|auth|login|credentials|identity"
+    :confidence 0.85}
+
+   {:keyword :authorization
+    :pattern #"(?i)authorization|permission|access control|rbac|policy"
+    :confidence 0.85}
+
+   {:keyword :performance
+    :pattern #"(?i)performance|latency|throughput|optimization|speed|benchmark"
+    :confidence 0.80}
+
+   {:keyword :scalability
+    :pattern #"(?i)scalability|scale|scaling|distributed|horizontal|vertical"
+    :confidence 0.85}
+
+   {:keyword :api
+    :pattern #"(?i)\bapi\b|rest|restful|endpoint|graphql|grpc"
+    :confidence 0.90}
+
+   {:keyword :database
+    :pattern #"(?i)database|sql|query|postgres|mysql|mongodb|schema"
+    :confidence 0.85}
+
+   {:keyword :testing
+    :pattern #"(?i)testing|test|unit test|integration test|coverage|tdd"
+    :confidence 0.85}
+
+   {:keyword :deployment
+    :pattern #"(?i)deployment|deploy|ci/cd|pipeline|release|rollout"
+    :confidence 0.80}
+
+   {:keyword :monitoring
+    :pattern #"(?i)monitoring|observability|metrics|logging|tracing|alerts"
+    :confidence 0.85}
+
+   {:keyword :caching
+    :pattern #"(?i)caching|cache|redis|memcached|cdn"
+    :confidence 0.90}
+
+   {:keyword :migration
+    :pattern #"(?i)migration|migrate|upgrade|transition|legacy"
+    :confidence 0.80}
+
+   {:keyword :documentation
+    :pattern #"(?i)documentation|docs|guide|tutorial|reference|readme"
+    :confidence 0.75}
+
+   {:keyword :error-handling
+    :pattern #"(?i)error handling|exception|fault tolerance|retry|circuit breaker"
+    :confidence 0.85}])
+
+;; ============================================================================
+;; Suggestion Logic
+;; ============================================================================
+
+(defn analyze-content
+  "Analyze content and suggest keywords based on patterns.
+
+   Args:
+     content: File content string
+
+   Returns:
+     Sequence of {:keyword kw :confidence float :reason string}"
+  [content]
+  (keep (fn [{:keys [keyword pattern confidence]}]
+          (when (re-find pattern content)
+            {:keyword keyword
+             :confidence confidence
+             :reason (str "Contains " (second (re-find pattern content)))}))
+        suggestion-patterns))
+
+(defn filter-by-taxonomy
+  "Filter suggestions to only include keywords in taxonomy.
+
+   Args:
+     suggestions: Sequence of suggestion maps
+     taxonomy: Set of valid keywords (or nil to skip filtering)
+
+   Returns:
+     Filtered sequence, possibly with adjusted confidence"
+  [suggestions taxonomy]
+  (if (nil? taxonomy)
+    suggestions
+    (map (fn [suggestion]
+           (if (contains? taxonomy (:keyword suggestion))
+             (update suggestion :confidence * 1.1) ; Boost confidence if in taxonomy
+             suggestion))
+         (filter #(contains? taxonomy (:keyword %)) suggestions))))
+
+(defn sort-suggestions
+  "Sort suggestions by confidence score (descending).
+
+   Args:
+     suggestions: Sequence of suggestion maps
+
+   Returns:
+     Sorted sequence"
+  [suggestions]
+  (reverse (sort-by :confidence suggestions)))
+
+(defn suggest-keywords-for-file
+  "Suggest keywords for a specific file.
+
+   Args:
+     file-path: Path to markdown file
+     taxonomy: Set of valid keywords (or nil)
+
+   Returns:
+     Sequence of {:keyword kw :confidence float :reason string}"
+  [file-path taxonomy]
+  (try
+    (let [content (slurp file-path)
+          suggestions (analyze-content content)
+          filtered (filter-by-taxonomy suggestions taxonomy)
+          sorted (sort-suggestions filtered)]
+      sorted)
+    (catch Exception e
+      (println "Error reading file:" (.getMessage e))
+      [])))
+
+;; ============================================================================
+;; Display Functions
+;; ============================================================================
+
+(defn print-suggestions
+  "Print keyword suggestions.
+
+   Args:
+     suggestions: Sequence of suggestion maps
+     show-confidence?: Whether to show confidence scores"
+  [suggestions show-confidence?]
+  (if (empty? suggestions)
+    (println "No keyword suggestions found")
+    (do
+      (println "Suggested keywords based on content:")
+      (println)
+      (doseq [{:keys [keyword confidence reason]} suggestions]
+        (if show-confidence?
+          (println (format "  :%s (%.0f%%) - %s"
+                           (name keyword)
+                           (* confidence 100)
+                           reason))
+          (println (format "  :%s" (name keyword))))))))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-suggest - Suggest keywords for a file based on content")
+  (println)
+  (println "Usage: doc-suggest [options] <file>")
+  (println)
+  (println "Options:")
+  (println "  --confidence           Show confidence scores and reasons")
+  (println "  --taxonomy-only        Only suggest keywords from taxonomy")
+  (println)
+  (println "Arguments:")
+  (println "  <file>  - Path to markdown file to analyze")
+  (println)
+  (println "Examples:")
+  (println "  doc-suggest doc/guide.md                  # Basic suggestions")
+  (println "  doc-suggest --confidence doc/api.md       # Show confidence scores")
+  (println "  doc-suggest --taxonomy-only doc/auth.md   # Only taxonomy keywords"))
+
+(defn -main
+  "Main entry point for doc-suggest command."
+  [& args]
+  (cond
+    (or (empty? args) (some #{"--help" "-h" "help"} args))
+    (print-usage)
+
+    :else
+    (let [flags (filter #(str/starts-with? % "--") args)
+          file-args (filter #(not (str/starts-with? % "--")) args)
+          show-confidence? (some #{"--confidence"} flags)
+          taxonomy-only? (some #{"--taxonomy-only"} flags)]
+
+      (when (empty? file-args)
+        (println "Error: No file specified")
+        (println)
+        (print-usage)
+        (System/exit 1))
+
+      (let [file-path (first file-args)
+            _ (when-not (fs/exists? file-path)
+                (println "Error: File not found:" file-path)
+                (System/exit 1))
+            ctx (load-project-context nil)
+            taxonomy (if taxonomy-only? (:taxonomy ctx) nil)
+            suggestions (suggest-keywords-for-file file-path taxonomy)]
+
+        (print-suggestions suggestions show-confidence?)))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:analyze-content analyze-content
+   :filter-by-taxonomy filter-by-taxonomy
+   :sort-suggestions sort-suggestions
+   :suggest-keywords-for-file suggest-keywords-for-file
+   :suggestion-patterns suggestion-patterns})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

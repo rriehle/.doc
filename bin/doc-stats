@@ -1,0 +1,300 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-stats
+  "Show keyword usage statistics across documentation.
+   Provides frequency analysis and trend insights."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def find-doc-files (:find-doc-files doc-core/exports))
+(def extract-keywords-from-file (:extract-keywords-from-file doc-core/exports))
+
+;; ============================================================================
+;; Statistics Calculation
+;; ============================================================================
+
+(defn calculate-keyword-frequencies
+  "Calculate keyword frequencies across files.
+
+   Args:
+     files: Sequence of file paths
+
+   Returns:
+     Map of keyword -> count"
+  [files]
+  (let [all-keywords (mapcat extract-keywords-from-file files)]
+    (frequencies all-keywords)))
+
+(defn calculate-file-stats
+  "Calculate per-file statistics.
+
+   Args:
+     files: Sequence of file paths
+
+   Returns:
+     {:total-files integer
+      :files-with-keywords integer
+      :avg-keywords-per-file float
+      :files-by-keyword-count {count -> num-files}}"
+  [files]
+  (let [file-keyword-counts (map #(count (extract-keywords-from-file %)) files)
+        total-files (count files)
+        files-with-keywords (count (filter pos? file-keyword-counts))
+        total-keywords (reduce + file-keyword-counts)
+        avg (if (pos? files-with-keywords)
+              (float (/ total-keywords files-with-keywords))
+              0.0)
+        by-count (frequencies file-keyword-counts)]
+    {:total-files total-files
+     :files-with-keywords files-with-keywords
+     :avg-keywords-per-file avg
+     :files-by-keyword-count by-count}))
+
+(defn calculate-project-stats
+  "Calculate statistics for a single project.
+
+   Args:
+     project-root: Project root path (nil for auto-discovery)
+
+   Returns:
+     {:project-name \"...\"
+      :keyword-frequencies {kw -> count}
+      :file-stats {...}
+      :total-unique-keywords integer
+      :total-keyword-usages integer}"
+  [project-root]
+  (let [ctx (load-project-context project-root)
+        config-result (:config-result ctx)
+        files (find-doc-files config-result)
+        project-name (fs/file-name (:project-root config-result))
+        keyword-freqs (calculate-keyword-frequencies files)
+        file-stats (calculate-file-stats files)]
+    {:project-name project-name
+     :keyword-frequencies keyword-freqs
+     :file-stats file-stats
+     :total-unique-keywords (count keyword-freqs)
+     :total-keyword-usages (reduce + (vals keyword-freqs))}))
+
+(defn merge-keyword-frequencies
+  "Merge keyword frequencies from multiple projects.
+
+   Args:
+     freq-maps: Sequence of frequency maps
+
+   Returns:
+     Merged frequency map"
+  [freq-maps]
+  (apply merge-with + freq-maps))
+
+(defn merge-file-stats
+  "Merge file statistics from multiple projects.
+
+   Args:
+     stats-seq: Sequence of file stats maps
+
+   Returns:
+     Merged stats map"
+  [stats-seq]
+  (let [total-files (reduce + (map :total-files stats-seq))
+        files-with-keywords (reduce + (map :files-with-keywords stats-seq))
+        total-keywords (* (reduce + (map :avg-keywords-per-file stats-seq))
+                          files-with-keywords)
+        avg (if (pos? files-with-keywords)
+              (float (/ total-keywords files-with-keywords))
+              0.0)]
+    {:total-files total-files
+     :files-with-keywords files-with-keywords
+     :avg-keywords-per-file avg}))
+
+(defn calculate-multi-project-stats
+  "Calculate combined statistics across projects.
+
+   Args:
+     projects: Sequence of project root paths
+
+   Returns:
+     {:projects [project-stats...]
+      :combined {...}}"
+  [projects]
+  (let [project-stats (map calculate-project-stats projects)
+        combined-freqs (merge-keyword-frequencies (map :keyword-frequencies project-stats))
+        combined-file-stats (merge-file-stats (map :file-stats project-stats))]
+    {:projects project-stats
+     :combined {:keyword-frequencies combined-freqs
+                :file-stats combined-file-stats
+                :total-unique-keywords (count combined-freqs)
+                :total-keyword-usages (reduce + (vals combined-freqs))}}))
+
+;; ============================================================================
+;; Display Functions
+;; ============================================================================
+
+(defn print-keyword-frequency-table
+  "Print keyword frequency table.
+
+   Args:
+     frequencies: Map of keyword -> count
+     top-n: Number of top keywords to show (nil for all)"
+  [frequencies top-n]
+  (let [sorted (reverse (sort-by val frequencies))
+        limited (if top-n (take top-n sorted) sorted)]
+    (println "Keyword usage statistics:")
+    (println "========================")
+    (doseq [[kw count] limited]
+      (println (format "%-30s %4d" (str ":" (name kw)) count)))))
+
+(defn print-file-stats
+  "Print file statistics summary.
+
+   Args:
+     stats: File stats map"
+  [stats]
+  (println)
+  (println "File statistics:")
+  (println "================")
+  (println "Total files:" (:total-files stats))
+  (println "Files with keywords:" (:files-with-keywords stats))
+  (println (format "Average keywords per file: %.1f" (:avg-keywords-per-file stats))))
+
+(defn print-summary-stats
+  "Print summary statistics.
+
+   Args:
+     stats: Stats map with :total-unique-keywords and :total-keyword-usages"
+  [stats]
+  (println)
+  (println "Summary:")
+  (println "========")
+  (println "Total unique keywords:" (:total-unique-keywords stats))
+  (println "Total keyword usages:" (:total-keyword-usages stats)))
+
+(defn print-project-header
+  "Print project header for multi-project output."
+  [project-name]
+  (println)
+  (println "======================")
+  (println "Project:" project-name)
+  (println "======================"))
+
+(defn print-project-stats
+  "Print statistics for a single project."
+  [stats show-header? top-n]
+  (when show-header?
+    (print-project-header (:project-name stats)))
+  (print-keyword-frequency-table (:keyword-frequencies stats) top-n)
+  (print-file-stats (:file-stats stats))
+  (print-summary-stats stats))
+
+;; ============================================================================
+;; Multi-Project Support
+;; ============================================================================
+
+(defn resolve-projects
+  "Resolve list of project roots from args."
+  [args]
+  (if (empty? args)
+    [nil]
+    (map #(str (fs/absolutize %)) args)))
+
+;; ============================================================================
+;; Command-Line Parsing
+;; ============================================================================
+
+(defn parse-options
+  "Parse command-line options.
+
+   Args:
+     args: Command-line arguments
+
+   Returns:
+     {:projects [...]
+      :top-n integer|nil}"
+  [args]
+  (let [flags (filter #(str/starts-with? % "--") args)
+        projects (filter #(not (str/starts-with? % "--")) args)
+        top-n-arg (first (filter #(str/starts-with? % "--top=") flags))
+        top-n (when top-n-arg
+                (Integer/parseInt (subs top-n-arg 6)))]
+    {:projects (resolve-projects projects)
+     :top-n top-n}))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-stats - Show keyword usage statistics")
+  (println)
+  (println "Usage: doc-stats [options] [project ...]")
+  (println)
+  (println "Options:")
+  (println "  --top=N                Show only top N keywords (default: all)")
+  (println)
+  (println "Arguments:")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println "               Multiple projects can be specified for combined statistics")
+  (println)
+  (println "Examples:")
+  (println "  doc-stats                        # Show stats for current project")
+  (println "  doc-stats --top=10               # Show top 10 keywords only")
+  (println "  doc-stats ~/p1 ~/p2 ~/p3        # Combined stats across projects"))
+
+(defn -main
+  "Main entry point for doc-stats command."
+  [& args]
+  (cond
+    (some #{"--help" "-h" "help"} args)
+    (print-usage)
+
+    :else
+    (let [options (parse-options args)
+          projects (:projects options)
+          top-n (:top-n options)
+          multi-project? (> (count projects) 1)]
+
+      (if multi-project?
+        ;; Multi-project mode
+        (let [stats (calculate-multi-project-stats projects)]
+          ;; Print individual project stats
+          (doseq [project-stat (:projects stats)]
+            (print-project-stats project-stat true top-n))
+
+          ;; Print combined stats
+          (println)
+          (println "======================")
+          (println "Combined Statistics")
+          (println "======================")
+          (println "Projects analyzed:" (count projects))
+          (print-keyword-frequency-table (get-in stats [:combined :keyword-frequencies]) top-n)
+          (print-file-stats (get-in stats [:combined :file-stats]))
+          (print-summary-stats (:combined stats)))
+
+        ;; Single project mode
+        (let [stats (calculate-project-stats (first projects))]
+          (print-project-stats stats false top-n))))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:calculate-keyword-frequencies calculate-keyword-frequencies
+   :calculate-file-stats calculate-file-stats
+   :calculate-project-stats calculate-project-stats
+   :merge-keyword-frequencies merge-keyword-frequencies
+   :merge-file-stats merge-file-stats
+   :parse-options parse-options})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

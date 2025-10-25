@@ -1,0 +1,232 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-graph
+  "Generate keyword relationship graph in GraphViz DOT format.
+   Shows which keywords appear together in documents."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def find-doc-files (:find-doc-files doc-core/exports))
+(def extract-keywords-from-file (:extract-keywords-from-file doc-core/exports))
+
+;; ============================================================================
+;; Graph Building
+;; ============================================================================
+
+(defn extract-keyword-cooccurrences
+  "Extract keyword co-occurrences from a file.
+   Returns all pairs of keywords that appear together.
+
+   Args:
+     file-path: Path to markdown file
+
+   Returns:
+     Set of [kw1 kw2] pairs (ordered)"
+  [file-path]
+  (let [keywords (vec (extract-keywords-from-file file-path))
+        pairs (for [i (range (count keywords))
+                    j (range (inc i) (count keywords))
+                    :let [kw1 (nth keywords i)
+                          kw2 (nth keywords j)]
+                    :when (not= kw1 kw2)]
+                (if (neg? (compare (name kw1) (name kw2)))
+                  [kw1 kw2]
+                  [kw2 kw1]))]
+    (set pairs)))
+
+(defn build-edge-weights
+  "Build edge weights from files.
+   Edge weight = number of files where keywords co-occur.
+
+   Args:
+     files: Sequence of file paths
+
+   Returns:
+     Map of [kw1 kw2] -> count"
+  [files]
+  (let [all-pairs (mapcat extract-keyword-cooccurrences files)]
+    (frequencies all-pairs)))
+
+(defn build-project-graph
+  "Build keyword co-occurrence graph for a project.
+
+   Args:
+     project-root: Project root path (nil for auto-discovery)
+
+   Returns:
+     {:project-name \"...\"
+      :edges {[kw1 kw2] -> weight}
+      :total-edges integer}"
+  [project-root]
+  (let [ctx (load-project-context project-root)
+        config-result (:config-result ctx)
+        files (find-doc-files config-result)
+        project-name (fs/file-name (:project-root config-result))
+        edges (build-edge-weights files)]
+    {:project-name project-name
+     :edges edges
+     :total-edges (count edges)}))
+
+(defn merge-edge-weights
+  "Merge edge weights from multiple projects.
+
+   Args:
+     edge-maps: Sequence of edge weight maps
+
+   Returns:
+     Merged edge weight map"
+  [edge-maps]
+  (apply merge-with + edge-maps))
+
+(defn build-multi-project-graph
+  "Build combined graph across multiple projects.
+
+   Args:
+     projects: Sequence of project root paths
+
+   Returns:
+     Combined edge weight map"
+  [projects]
+  (let [project-graphs (map build-project-graph projects)
+        edge-maps (map :edges project-graphs)]
+    (merge-edge-weights edge-maps)))
+
+;; ============================================================================
+;; DOT Format Generation
+;; ============================================================================
+
+(defn format-keyword-label
+  "Format keyword for DOT label."
+  [kw]
+  (name kw))
+
+(defn generate-dot-graph
+  "Generate GraphViz DOT format from edge weights.
+
+   Args:
+     edges: Map of [kw1 kw2] -> weight
+     options: Optional {:show-weights? true/false
+                       :min-weight integer}
+
+   Returns:
+     String in DOT format"
+  [edges {:keys [show-weights? min-weight] :or {show-weights? false min-weight 1}}]
+  (let [filtered-edges (filter (fn [[_ weight]] (>= weight min-weight)) edges)
+        lines (vec
+               (concat
+                ["digraph KeywordRelationships {"
+                 "  rankdir=LR;"
+                 "  node [shape=box, style=rounded];"]
+                (map (fn [[[kw1 kw2] weight]]
+                       (if show-weights?
+                         (format "  \"%s\" -> \"%s\" [label=\"%d\"];"
+                                 (format-keyword-label kw1)
+                                 (format-keyword-label kw2)
+                                 weight)
+                         (format "  \"%s\" -> \"%s\";"
+                                 (format-keyword-label kw1)
+                                 (format-keyword-label kw2))))
+                     (sort-by first filtered-edges))
+                ["}"]))]
+    (str/join "\n" lines)))
+
+;; ============================================================================
+;; Multi-Project Support
+;; ============================================================================
+
+(defn resolve-projects
+  "Resolve list of project roots from args."
+  [args]
+  (if (empty? args)
+    [nil]
+    (map #(str (fs/absolutize %)) args)))
+
+;; ============================================================================
+;; Command-Line Parsing
+;; ============================================================================
+
+(defn parse-options
+  "Parse command-line options.
+
+   Args:
+     args: Command-line arguments
+
+   Returns:
+     {:projects [...]
+      :show-weights? true/false
+      :min-weight integer}"
+  [args]
+  (let [flags (filter #(str/starts-with? % "--") args)
+        projects (filter #(not (str/starts-with? % "--")) args)]
+    {:projects (resolve-projects projects)
+     :show-weights? (some #{"--weights"} flags)
+     :min-weight (if-let [weight-arg (first (filter #(str/starts-with? % "--min-weight=") flags))]
+                   (Integer/parseInt (subs weight-arg 13))
+                   1)}))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-graph - Generate keyword relationship graph")
+  (println)
+  (println "Usage: doc-graph [options] [project ...]")
+  (println)
+  (println "Options:")
+  (println "  --weights              Show edge weights (co-occurrence counts)")
+  (println "  --min-weight=N         Only show edges with weight >= N (default: 1)")
+  (println)
+  (println "Arguments:")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println "               Multiple projects can be specified for cross-project graph")
+  (println)
+  (println "Output:")
+  (println "  GraphViz DOT format graph to stdout")
+  (println)
+  (println "Examples:")
+  (println "  doc-graph                            # Generate graph for current project")
+  (println "  doc-graph --weights                  # Show co-occurrence counts")
+  (println "  doc-graph --min-weight=3             # Only strong relationships")
+  (println "  doc-graph ~/p1 ~/p2                  # Cross-project graph")
+  (println "  doc-graph > keywords.dot             # Save to file")
+  (println "  doc-graph | dot -Tpng > graph.png   # Generate PNG image"))
+
+(defn -main
+  "Main entry point for doc-graph command."
+  [& args]
+  (cond
+    (or (empty? args) (some #{"--help" "-h" "help"} args))
+    (print-usage)
+
+    :else
+    (let [options (parse-options args)
+          edges (build-multi-project-graph (:projects options))
+          dot (generate-dot-graph edges options)]
+      (println dot))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:extract-keyword-cooccurrences extract-keyword-cooccurrences
+   :build-edge-weights build-edge-weights
+   :build-project-graph build-project-graph
+   :merge-edge-weights merge-edge-weights
+   :generate-dot-graph generate-dot-graph
+   :parse-options parse-options})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

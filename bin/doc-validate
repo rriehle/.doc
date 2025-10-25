@@ -1,0 +1,223 @@
+#!/usr/bin/env bb
+
+(ns ^:clj-kondo/ignore doc-validate
+  "Validate documentation keywords against taxonomy.
+   Checks all markdown files in configured doc directory for keyword compliance."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]))
+
+;; Load doc-core library
+(load-file (str (fs/expand-home "~/.doc/doc-core.bb")))
+
+;; Import functions from doc-core
+(def load-project-context (:load-project-context doc-core/exports))
+(def find-doc-files (:find-doc-files doc-core/exports))
+(def extract-keywords-from-file (:extract-keywords-from-file doc-core/exports))
+(def validate-keywords-against-taxonomy (:validate-keywords-against-taxonomy doc-core/exports))
+
+;; ============================================================================
+;; Validation Logic
+;; ============================================================================
+
+(defn validate-file
+  "Validate keywords in a single file against taxonomy.
+
+   Args:
+     file-path: Path to markdown file
+     taxonomy: Set of valid keywords (or nil to skip validation)
+     doc-dir: Documentation directory path (for relative path display)
+
+   Returns:
+     {:file \"relative/path.md\"
+      :keywords #{:kw1 :kw2}
+      :valid #{:kw1}
+      :invalid #{:kw2}
+      :all-valid? true|false}"
+  [file-path taxonomy doc-dir]
+  (let [keywords (extract-keywords-from-file file-path)
+        validation (validate-keywords-against-taxonomy keywords taxonomy)
+        rel-path (str/replace file-path (str doc-dir "/") "")]
+    (merge validation
+           {:file rel-path
+            :keywords keywords})))
+
+(defn validate-project
+  "Validate all documentation in a project.
+
+   Args:
+     project-root: (optional) Project root path
+
+   Returns:
+     {:project-root \"...\"
+      :project-name \"...\"
+      :taxonomy-found? true|false
+      :file-results [{:file ... :valid ... :invalid ...}]
+      :all-valid? true|false
+      :total-files integer
+      :total-invalid integer}"
+  [project-root]
+  (let [ctx (load-project-context project-root)
+        config-result (:config-result ctx)
+        doc-dir (:doc-dir ctx)
+        taxonomy (:taxonomy ctx)
+        taxonomy-path (:taxonomy-path ctx)
+        files (find-doc-files config-result)
+        project-name (fs/file-name (:project-root config-result))]
+
+    (if-not (fs/exists? taxonomy-path)
+      ;; No taxonomy - skip validation
+      {:project-root (:project-root config-result)
+       :project-name project-name
+       :taxonomy-found? false
+       :taxonomy-path taxonomy-path
+       :file-results []
+       :all-valid? true
+       :total-files 0
+       :total-invalid 0}
+
+      ;; Validate all files
+      (let [results (map #(validate-file % taxonomy doc-dir) files)
+            invalid-results (filter #(not (:all-valid? %)) results)
+            all-valid? (empty? invalid-results)]
+        {:project-root (:project-root config-result)
+         :project-name project-name
+         :taxonomy-found? true
+         :taxonomy-path taxonomy-path
+         :file-results results
+         :all-valid? all-valid?
+         :total-files (count files)
+         :total-invalid (count invalid-results)}))))
+
+;; ============================================================================
+;; Display Functions
+;; ============================================================================
+
+(defn print-project-header
+  "Print project header for multi-project output."
+  [project-name]
+  (println)
+  (println "======================")
+  (println "Project:" project-name)
+  (println "======================"))
+
+(defn print-validation-results
+  "Print validation results for a project.
+
+   Args:
+     result: Result map from validate-project
+     show-header?: Whether to show project header"
+  [result show-header?]
+  (when show-header?
+    (print-project-header (:project-name result)))
+
+  (cond
+    (not (:taxonomy-found? result))
+    (do
+      (println "⚠ Warning: Taxonomy file not found:" (:taxonomy-path result))
+      (println "Skipping validation for this project"))
+
+    (:all-valid? result)
+    (println "✓ All keywords valid (" (:total-files result) "files checked)")
+
+    :else
+    (do
+      (println "❌ Invalid keywords found:")
+      (doseq [{:keys [file invalid]} (:file-results result)
+              :when (seq invalid)]
+        (println (str "\n" file ":"))
+        (doseq [kw (sort invalid)]
+          (println (str "  - :" (name kw))))))))
+
+;; ============================================================================
+;; Multi-Project Support
+;; ============================================================================
+
+(defn resolve-projects
+  "Resolve list of project roots from args.
+
+   Args:
+     args: Command-line arguments
+
+   Returns:
+     Sequence of absolute project root paths"
+  [args]
+  (if (empty? args)
+    [nil]  ; Use automatic discovery
+    (map #(str (fs/absolutize %)) args)))
+
+(defn validate-projects
+  "Validate multiple projects.
+
+   Args:
+     projects: Sequence of project root paths (nil for auto-discovery)
+
+   Returns:
+     Sequence of validation result maps"
+  [projects]
+  (map validate-project projects))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn print-usage
+  "Print usage information."
+  []
+  (println "doc-validate - Validate documentation keywords against taxonomy")
+  (println)
+  (println "Usage: doc-validate [project ...]")
+  (println)
+  (println "Arguments:")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println "               Multiple projects can be specified for cross-project validation")
+  (println)
+  (println "Examples:")
+  (println "  doc-validate                    # Validate current project")
+  (println "  doc-validate ~/proj1            # Validate specific project")
+  (println "  doc-validate ~/p1 ~/p2 ~/p3    # Validate multiple projects")
+  (println)
+  (println "Configuration:")
+  (println "  Create .doc.edn in project root to customize:")
+  (println "  {:doc {:path \"doc\"")
+  (println "         :taxonomy \"doc-tools/keyword-taxonomy.md\"}}")
+  (println)
+  (println "Exit codes:")
+  (println "  0 - All keywords valid")
+  (println "  1 - Invalid keywords found"))
+
+(defn -main
+  "Main entry point for doc-validate command."
+  [& args]
+  (cond
+    (or (some #{"--help" "-h" "help"} args) (nil? args))
+    (print-usage)
+
+    :else
+    (let [projects (resolve-projects args)
+          results (validate-projects projects)
+          show-headers? (> (count projects) 1)
+          all-valid? (every? :all-valid? results)]
+
+      ;; Print results for each project
+      (doseq [result results]
+        (print-validation-results result show-headers?))
+
+      ;; Exit with appropriate code
+      (System/exit (if all-valid? 0 1)))))
+
+;; ============================================================================
+;; Export for Testing
+;; ============================================================================
+
+(def exports
+  {:validate-file validate-file
+   :validate-project validate-project
+   :validate-projects validate-projects
+   :resolve-projects resolve-projects})
+
+;; ============================================================================
+;; CLI Entry Point
+;; ============================================================================
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
